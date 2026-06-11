@@ -1,27 +1,18 @@
-This file is part of the SyntheticMind / BitDrop project.
-
-Copyright (C) 2026 Thomas Price
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-
-
-# ============================================================
-# bitdrop_core/ai/compression/bitdrop_3d_binary_pipeline.py
-# BitDrop 3D Binary Pipeline + TurboQuant-style 4-bit quantization
-# All-in-one engine: BitDropCollapseEngineV2
-# ============================================================
+# BitDrop V2 - 3D Collapse-Based Compression Engine
+# Copyright (C) 2026  Thomas Price
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
@@ -34,29 +25,25 @@ from typing import Any, Dict, List, Tuple, Optional
 class BitDropCollapseEngineV2:
     """
     All-in-one 3D BitDrop engine with:
-      - Pre-clustering
+      - Pre-clustering (3D-aware)
       - 3D chunking
-      - Grouping into regions
+      - Region grouping
       - Hierarchical tagging
       - Rule-template generation
       - Adjacency masks
       - Rule pruning
-      - Constraint-driven collapse
+      - Constraint-driven collapse (entropy/complexity-aware)
       - Stabilization
-      - TurboQuant-style 4-bit quantization
+      - TurboQuant-style 4-bit quantization (nibble-packed)
       - Final binary container + entropy coding
     """
 
-    # -----------------------------
-    # Internal data structures
-    # -----------------------------
-
     @dataclass
     class BinaryBlock3D:
-        data: bytes          # raw or quantized bytes
+        data: bytes
         shape: Tuple[int, int, int]
         tags: Dict[str, Any]
-        index: int           # original index
+        index: int
 
     @dataclass
     class TagNode:
@@ -78,33 +65,39 @@ class BitDropCollapseEngineV2:
         max_neighbors: int
         allowed_delta: int
 
-    # -----------------------------
-    # Constants
-    # -----------------------------
-
     MAGIC = b"BD3Q"
     VERSION = 1
-
-    # -----------------------------
-    # Init
-    # -----------------------------
 
     def __init__(
         self,
         block_shape: Tuple[int, int, int] = (4, 4, 64),
         level: int = 9,
         max_clusters: int = 32,
+        auto_tune_block_shape: bool = True,
+        region_block_target: int = 2048,
     ):
         self.block_shape = block_shape
         self.level = level
         self.max_clusters = max_clusters
-
-        # Tag hierarchy root
+        self.auto_tune_block_shape = auto_tune_block_shape
+        self.region_block_target = region_block_target
         self._tag_root = self.TagNode("ROOT", {})
 
     # -----------------------------
     # 3D Chunking + Grouping
     # -----------------------------
+
+    def _auto_tune_shape(self, payload_len: int) -> None:
+        if not self.auto_tune_block_shape:
+            return
+        # Simple heuristic: smaller payloads → smaller depth
+        d0, d1, _ = self.block_shape
+        if payload_len > 8_000_000:
+            self.block_shape = (d0, d1, 64)
+        elif payload_len > 2_000_000:
+            self.block_shape = (d0, d1, 48)
+        else:
+            self.block_shape = (d0, d1, 32)
 
     def _to_blocks(self, payload_bytes: bytes) -> List["BitDropCollapseEngineV2.BinaryBlock3D"]:
         d0, d1, d2 = self.block_shape
@@ -134,11 +127,65 @@ class BitDropCollapseEngineV2:
     ) -> List[List["BitDropCollapseEngineV2.BinaryBlock3D"]]:
         if not blocks:
             return []
-        # Single region for now; can be extended to multiple semantic regions
-        return [blocks]
+        # Multi-region grouping: split into chunks of region_block_target blocks
+        regions: List[List[BitDropCollapseEngineV2.BinaryBlock3D]] = []
+        n = len(blocks)
+        step = max(1, self.region_block_target)
+        for i in range(0, n, step):
+            regions.append(blocks[i:i + step])
+        return regions
 
     # -----------------------------
-    # TurboQuant-style 4-bit Quantizer
+    # 3D Cube Metrics
+    # -----------------------------
+
+    def _cube_metrics(
+        self,
+        block: "BitDropCollapseEngineV2.BinaryBlock3D",
+    ) -> Tuple[int, int, int, int]:
+        d0, d1, d2 = block.shape
+        data = block.data
+        n = d0 * d1 * d2
+        if not data or n == 0:
+            return 0, 0, 0, 0
+
+        vals = list(data)
+        nz = sum(1 for v in vals if v != 0)
+        s = sum(vals)
+        mean = s // n
+
+        var_acc = 0
+        for v in vals:
+            dv = v - mean
+            var_acc += dv * dv
+        var_approx = var_acc // n
+
+        edge_energy = 0
+        idx = 0
+        for z in range(d2):
+            for y in range(d1):
+                for x in range(d0):
+                    v = vals[idx]
+                    if x + 1 < d0:
+                        v2 = vals[idx + 1]
+                        edge_energy += abs(v - v2)
+                    if y + 1 < d1:
+                        v2 = vals[idx + d0]
+                        edge_energy += abs(v - v2)
+                    if z + 1 < d2:
+                        v2 = vals[idx + d0 * d1]
+                        edge_energy += abs(v - v2)
+                    idx += 1
+
+        nz = int(nz & 0xFFFFFFFF)
+        mean = int(mean & 0xFFFF)
+        var_approx = int(var_approx & 0xFFFFFFFF)
+        edge_energy = int(edge_energy & 0xFFFFFFFF)
+
+        return nz, mean, var_approx, edge_energy
+
+    # -----------------------------
+    # TurboQuant-style 4-bit Quantizer (nibble-packed)
     # -----------------------------
 
     def _quantize_block(
@@ -155,29 +202,50 @@ class BitDropCollapseEngineV2:
         if vmax == vmin:
             scale = 1.0
             zero = float(vmin)
-            q = bytes([0] * len(vals))
-            return q, scale, zero
+            # All zeros in quantized space
+            n = len(vals)
+            packed_len = (n + 1) // 2
+            return bytes([0] * packed_len), scale, zero
 
         scale = (vmax - vmin) / 15.0
         zero = float(vmin)
 
-        q_bytes = bytearray(len(vals))
+        n = len(vals)
+        packed_len = (n + 1) // 2
+        packed = bytearray(packed_len)
         inv_scale = 1.0 / scale
+
         for i, v in enumerate(vals):
             q = int((v - vmin) * inv_scale + 0.5)
             if q < 0:
                 q = 0
             elif q > 15:
                 q = 15
-            q_bytes[i] = q
+            byte_index = i // 2
+            if (i & 1) == 0:
+                packed[byte_index] = q & 0x0F
+            else:
+                packed[byte_index] |= (q & 0x0F) << 4
 
-        return bytes(q_bytes), scale, zero
+        return bytes(packed), scale, zero
 
-    def _dequantize_block(self, qdata: bytes, scale: float, zero: float) -> bytes:
-        if not qdata:
+    def _dequantize_block(
+        self,
+        qdata: bytes,
+        scale: float,
+        zero: float,
+        n_elems: int,
+    ) -> bytes:
+        if not qdata or n_elems <= 0:
             return b""
-        out = bytearray(len(qdata))
-        for i, q in enumerate(qdata):
+        out = bytearray(n_elems)
+        for i in range(n_elems):
+            byte_index = i // 2
+            b = qdata[byte_index]
+            if (i & 1) == 0:
+                q = b & 0x0F
+            else:
+                q = (b >> 4) & 0x0F
             v = int(zero + q * scale + 0.5)
             if v < 0:
                 v = 0
@@ -187,17 +255,15 @@ class BitDropCollapseEngineV2:
         return bytes(out)
 
     # -----------------------------
-    # Pre-Clustering
+    # Pre-Clustering (3D-aware)
     # -----------------------------
 
     def _block_signature(
         self,
         block: "BitDropCollapseEngineV2.BinaryBlock3D",
     ) -> Tuple[int, int, int]:
-        data = block.data
-        nz = sum(1 for b in data if b != 0)
-        mean = sum(data) // max(1, len(data))
-        h = hash(data) & 0xFFFFFFFF
+        nz, mean, var_approx, edge_energy = self._cube_metrics(block)
+        h = (var_approx ^ (edge_energy << 1) ^ (nz << 3) ^ (mean << 5)) & 0xFFFFFFFF
         return nz, mean, h
 
     def _cluster_blocks(
@@ -276,13 +342,23 @@ class BitDropCollapseEngineV2:
     ) -> "_AdjacencyMask":
         n = len(blocks)
         mask = self._AdjacencyMask(n)
-        sigs = [hash(b.data) & 0xFFFF for b in blocks]
+
+        sigs = []
+        for b in blocks:
+            nz, mean, h = self._block_signature(b)
+            sigs.append((nz, mean, h))
 
         for i in range(n):
+            nzi, mi, hi = sigs[i]
             for j in range(n):
                 if i == j:
                     continue
-                if abs(sigs[i] - sigs[j]) <= 1024:
+                nzj, mj, hj = sigs[j]
+                dnz = abs(nzi - nzj)
+                dm = abs(mi - mj)
+                dh = abs(hi - hj)
+                score = dnz + (dm * 4) + (dh >> 10)
+                if score <= 4096:
                     mask.allow(i, j)
                 else:
                     mask.forbid(i, j)
@@ -294,7 +370,6 @@ class BitDropCollapseEngineV2:
         blocks: List["BitDropCollapseEngineV2.BinaryBlock3D"],
         template: "BitDropCollapseEngineV2.RuleTemplate",
     ) -> None:
-        # Placeholder: keep all templates for now.
         return
 
     # -----------------------------
@@ -313,9 +388,14 @@ class BitDropCollapseEngineV2:
         used = [False] * n
         order: List[int] = []
 
-        hashes = [(hash(b.data) & 0xFFFFFFFF, i) for i, b in enumerate(blocks)]
-        hashes.sort()
-        current = hashes[0][1]
+        # Start from lowest "complexity" block (nz + var + edge)
+        complexities: List[Tuple[int, int]] = []
+        for i, b in enumerate(blocks):
+            nz, mean, var_approx, edge_energy = self._cube_metrics(b)
+            complexity = nz + (var_approx >> 4) + (edge_energy >> 6) + (mean << 2)
+            complexities.append((complexity, i))
+        complexities.sort()
+        current = complexities[0][1]
         order.append(current)
         used[current] = True
 
@@ -342,7 +422,6 @@ class BitDropCollapseEngineV2:
         self,
         blocks: List["BitDropCollapseEngineV2.BinaryBlock3D"],
     ) -> List["BitDropCollapseEngineV2.BinaryBlock3D"]:
-        # Hook for future consistency checks; identity for now.
         return blocks
 
     # -----------------------------
@@ -437,17 +516,15 @@ class BitDropCollapseEngineV2:
     # -----------------------------
 
     def encode(self, payload_bytes: bytes) -> bytes:
-        # 1) Chunk into 3D blocks
-        blocks = self._to_blocks(payload_bytes)
+        self._auto_tune_shape(len(payload_bytes))
 
-        # 2) Group into regions
+        blocks = self._to_blocks(payload_bytes)
         regions = self._group_blocks(blocks)
 
         collapsed_all: List[BitDropCollapseEngineV2.BinaryBlock3D] = []
         scales_all: List[float] = []
         zeros_all: List[float] = []
 
-        # 3) For each region: pre-cluster, tag, rules, collapse, stabilize
         for region in regions:
             clusters = self._cluster_blocks(region)
             for cid, cblocks in clusters.items():
@@ -458,7 +535,6 @@ class BitDropCollapseEngineV2:
                 collapsed = self._collapse_cluster(cblocks, mask)
                 stabilized = self._stabilize(collapsed)
 
-                # 4) TurboQuant-style quantization per block
                 for b in stabilized:
                     qdata, scale, zero = self._quantize_block(b)
                     collapsed_all.append(
@@ -472,33 +548,21 @@ class BitDropCollapseEngineV2:
                     scales_all.append(scale)
                     zeros_all.append(zero)
 
-        # 5) Final container + entropy coding
         container = self._pack_blocks(collapsed_all, scales_all, zeros_all)
         blob = self._compress(container)
         return blob
 
     def decode(self, blob: bytes) -> bytes:
-        # 1) Decompress
         container = self._decompress(blob)
-        # 2) Unpack quantized blocks + params
         qblocks, scales, zeros = self._unpack_blocks(container)
-        # 3) Dequantize and reassemble
+
+        d0, d1, d2 = self.block_shape
+        n_elems = d0 * d1 * d2
+
         out = bytearray()
         for b, s, z in zip(qblocks, scales, zeros):
-            data = self._dequantize_block(b.data, s, z)
+            data = self._dequantize_block(b.data, s, z, n_elems)
             out += data
         return bytes(out)
-
-
-
-
-
-
-
-
-
-
-
-
 
 

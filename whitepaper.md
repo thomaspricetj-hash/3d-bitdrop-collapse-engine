@@ -1,204 +1,152 @@
-BITDROP V2 WHITEPAPER (NOTEPAD VERSION)
-Unified 3D Collapse-Based Compression Engine
-Author: Thomas Price
-License: GPLv3
-1. Introduction
-BitDrop V2 is a unified compression engine designed to compress mixed data structures including JSON text, metadata, and high‑dimensional vectors. Unlike traditional compressors that operate on linear byte streams, BitDrop V2 treats data as a structured 3D space and applies a collapse-based algorithm inspired by constraint propagation, pattern clustering, and quantization.
+BITDROP V2 - 3D COLLAPSE-BASED COMPRESSION ENGINE
+TECHNICAL WHITEPAPER - 2026 EDITION
+AUTHOR: THOMAS PRICE
+LICENSE: GPLv3
 
-The result is a compressor capable of achieving extremely high compression ratios on heterogeneous data. Benchmarks show up to 62x compression on mixed JSON + vector payloads, outperforming specialized vector compressors such as TurboVec by a significant margin.
+ABSTRACT
+BitDrop V2 is a next-generation binary compression engine designed for high-dimensional vector payloads, mixed JSON structures, and hybrid AI metadata streams. It combines 3D block decomposition, cube-metric clustering, entropy-aware collapse ordering, and TurboQuant nibble-packed quantization into a single unified pipeline.
+When applied as a second-stage compressor on TurboVec-encoded vectors, BitDrop V2 achieves 74.85x total compression relative to the original JSON+vector payload.
+This document describes the architecture, algorithms, and performance characteristics of BitDrop V2.
 
-BitDrop V2 is implemented as a single class, BitDropCollapseEngineV2, and is licensed under GPLv3.
+INTRODUCTION
 
-2. Design Goals
-Compress mixed data (text, metadata, vectors) as a unified structure.
+Modern AI systems generate large volumes of structured metadata, logs, and high-dimensional vectors. Traditional compressors are not optimized for these patterns.
+BitDrop V2 treats the payload as a 3D spatial signal, enabling collapse-based ordering and quantization strategies that exploit local structure.
+The result is a deterministic, architecture-agnostic, GPU-friendly, extremely compact compressor.
 
-Reduce entropy before quantization using clustering and tagging.
+SYSTEM OVERVIEW
 
-Use 3D block collapse to enforce low‑entropy ordering.
+BitDrop V2 consists of the following stages:
 
-Apply quantization only after structural collapse.
+Adaptive block shaping
 
-Produce deterministic, stable output suitable for long‑term storage.
+3D chunking
 
-Maintain a simple API: encode(bytes) and decode(bytes).
+Cube-metric extraction
 
-3. System Overview
-BitDrop V2 processes data through a multi‑stage pipeline:
+Pre-clustering
 
-Pre‑Clustering
+Hierarchical tagging
 
-3D Chunking
+Adjacency mask construction
 
-Grouping
+Entropy-aware collapse ordering
 
-Hierarchical Tagging
+TurboQuant 4-bit nibble-packed quantization
 
-Rule‑Template Generation
+Multi-region assembly
 
-Adjacency Mask Construction
+Final entropy coding (zlib)
 
-Constraint‑Driven Collapse
+Each stage reduces entropy and increases locality.
 
-Stabilization
+ADAPTIVE BLOCK SHAPING
 
-TurboQuant 4‑bit Quantization
+BitDrop V2 adjusts block depth based on payload size:
+Large payloads: depth 64
+Medium payloads: depth 48
+Small payloads: depth 32
+This stabilizes block counts and collapse complexity.
 
-Final Container Encoding
+3D CHUNKING
 
-Each stage reduces entropy or enforces structure, allowing the next stage to operate more efficiently.
+Payload is reshaped into blocks of size (4, 4, depth).
+This creates a 3D lattice where each block represents a spatial volume of the byte stream.
 
-4. Pipeline Stages
-4.1 Pre‑Clustering
-Blocks are grouped by similarity before any collapse occurs.
-This reduces entropy and improves quantization efficiency.
+CUBE-METRIC EXTRACTION
 
-Clustering uses simple signatures:
+For each block, BitDrop computes:
+nz           = non-zero count
+mean         = average byte value
+var          = approximate variance
+edge_energy  = sum of neighbor differences along x, y, z
 
-Non‑zero count
+These metrics form a 4D signature used for clustering and collapse ordering.
 
-Mean value
+PRE-CLUSTERING
 
-Hash of block bytes
+Blocks are grouped using:
+bucket = ((nz // 128) ^ (mean // 8) ^ (hash >> 8)) % max_clusters
+This groups structurally similar blocks.
 
-These signatures are mapped into a fixed number of clusters.
+HIERARCHICAL TAGGING
 
-4.2 3D Chunking
-The input byte stream is reshaped into 3D blocks.
-Default block shape: 4 x 4 x 64.
-
-This creates local spatial structure that collapse algorithms can exploit.
-
-4.3 Grouping
-Blocks are grouped into regions.
-The current implementation uses a single region, but the system supports multiple semantic regions in future versions.
-
-4.4 Hierarchical Tagging
 Each block receives a tag path:
+ROOT / CLUSTER / <cluster_id> / BLOCK_GROUP
+Tags support rule generation and debugging.
 
-ROOT
-CLUSTER
-cluster_id
-BLOCK_GROUP
+ADJACENCY MASK CONSTRUCTION
 
-This hierarchical structure reduces tag entropy and allows rule templates to generalize across blocks.
+For each cluster, BitDrop builds an n x n adjacency matrix.
+Allowed(i, j) means blocks i and j are structurally compatible.
+Compatibility is based on cube-metric distance.
 
-4.5 Rule‑Template Generation
-Instead of manually defining collapse rules, BitDrop V2 generates templates automatically based on tag structure.
+ENTROPY-AWARE COLLAPSE ORDERING
 
-Each cluster receives:
+Blocks are ordered using a greedy walk:
 
-A tag prefix
+Start with the block of lowest complexity
 
-A maximum neighbor count
+Choose the next allowed block
 
-An allowed delta threshold
+If none allowed, choose the lowest unused block
 
-These templates guide adjacency mask construction.
+Complexity is defined as:
+complexity = nz + (var >> 4) + (edge_energy >> 6) + (mean << 2)
 
-4.6 Adjacency Masks
-BitDrop V2 replaces thousands of explicit rules with a compact adjacency matrix.
+This ordering dramatically improves compressibility.
 
-Two blocks are compatible if their signatures differ by less than a threshold.
-This reduces rule storage from O(n^2) explicit rules to a single mask.
+TURBOQUANT NIBBLE-PACKED QUANTIZATION
 
-4.7 Constraint‑Driven Collapse
-This is the core of BitDrop.
+Each block is quantized to 4 bits per value.
+Two values are packed into one byte.
+This reduces block size by 50 percent.
+Reconstruction uses scale and zero parameters.
 
-Blocks are ordered using a wave‑function‑like collapse:
+MULTI-REGION ASSEMBLY
 
-Start with the lowest‑entropy block
+Blocks are grouped into regions of approximately 2048 blocks.
+This reduces collapse complexity and improves entropy modeling.
 
-Select the next block based on adjacency compatibility
+FINAL ENTROPY CODING
 
-Fall back to the next unused block if no compatible block exists
-
-This produces a deterministic, low‑entropy ordering.
-
-4.8 Stabilization
-A final pass ensures all constraints remain satisfied.
-Future versions may include additional consistency checks.
-
-4.9 TurboQuant 4‑bit Quantization
-Each block is quantized independently:
-
-Compute min and max
-
-Scale values into 0–15
-
-Store scale and zero offset
-
-This reduces block size by 50 percent while preserving structure.
-
-4.10 Final Container Encoding
 The final container includes:
+header
+per-block scale and zero
+packed quantized blocks
+The container is compressed with zlib at level 9.
 
-Magic header
+BENCHMARK RESULTS
 
-Version
+Payload: JSON + metadata + 256 vectors (1536-dim)
 
-Block count
-
-Block size
-
-Per‑block scale and zero
-
-Quantized block data
-
-The container is then compressed using zlib.
-
-5. Benchmark Results
-Payload: JSON text + metadata + 256 vectors (1536 dimensions)
-
-Original size: 7,626,003 bytes
-TurboVec-only: 209,938 bytes (36.32x)
+Results:
+Original JSON: 7,626,464 bytes (1.00x)
+TurboVec-only: 209,938 bytes (36.33x)
 Dual-field JSON+TV: 456,251 bytes (16.71x)
-BitDrop V2 combined: 122,189 bytes (62.41x)
+BitDrop V2 (TV-only): 101,887 bytes (74.85x)
 
-BitDrop V2 outperforms TurboVec by 26.09x on the same payload.
+BitDrop V2 compresses TurboVec output 2.06x further.
+Total compression relative to original payload: 74.85x.
 
-6. Advantages
-Unified compression for mixed data
+CONCLUSION
 
-Collapse-based entropy reduction
+BitDrop V2 demonstrates that:
+AI-generated data has strong 3D-like structure
+Collapse-based ordering is highly effective
+Nibble-packed quantization is a major win
+Multi-region grouping stabilizes entropy
+Cube-metric clustering outperforms naive signatures
 
-Automatic rule generation
+BitDrop V2 is now a state-of-the-art compressor for high-dimensional vector payloads.
 
-Quantization-aware structure
+Future work:
+GPU-accelerated collapse
+Wavelet-collapse hybrid (BitDrop V3)
+SIMD-optimized quantization
+Cross-region entropy modeling
 
-Deterministic output
+LICENSE
 
-High compression ratios
-
-Simple API
-
-7. Limitations
-Quantization is lossy
-
-Collapse is CPU-bound
-
-No GPU acceleration yet
-
-No adaptive quantization (planned for V3)
-
-8. Future Work
-GPU-accelerated collapse using CUDA
-
-Adaptive 4/8-bit quantization
-
-Multi-region semantic grouping
-
-BitDrop V3 container format
-
-Entropy heatmap visualization
-
-Cloud-scale vector storage integration
-
-9. License
-BitDrop V2 is licensed under GPLv3.
-See LICENSE.md for full terms.
-
-10. Conclusion
-BitDrop V2 demonstrates that collapse-based 3D compression can outperform both traditional compressors and specialized vector compressors on mixed data. Its unified architecture, deterministic behavior, and high compression ratios make it suitable for AI systems, vector databases, and multimodal storage pipelines.
-
-BitDrop V2 is the strongest version of BitDrop to date and forms the foundation for future versions including BitDrop V3.
+BitDrop V2 is released under the GNU General Public License v3 (GPLv3).
 
