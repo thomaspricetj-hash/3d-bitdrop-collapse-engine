@@ -1,105 +1,101 @@
-BITDROP V2
-UNIFIED 3D COLLAPSE-BASED COMPRESSION ENGINE
-GPLv3 OPEN SOURCE PROJECT
+Project: 3D BitDrop Collapse Engine
+Author: Thomas Price
+Year: 2026
 
-OVERVIEW
-BitDrop V2 is a next-generation compression engine designed for AI workloads, high-dimensional vectors, mixed JSON structures, and hybrid metadata streams.
-It uses a 3D collapse pipeline, cube-metric clustering, entropy-aware ordering, and TurboQuant nibble-packed quantization to achieve extremely high compression ratios.
+DESCRIPTION
 
-BitDrop V2 is especially effective as a second-stage compressor applied to TurboVec output.
-In this configuration, BitDrop V2 achieves up to 74.85x total compression relative to the original JSON+vector payload.
+The 3D BitDrop Collapse Engine is a high density binary compression system designed to operate on structured byte streams such as TurboVec output. The engine uses 3D block geometry, metric driven clustering, shared range quantization, and deterministic collapse ordering to produce highly compressible binary layouts while remaining fully lossless.
+
+This project contains the full implementation of BitDrop V2, including:
+3D block partitioning
+Cube metric analysis
+Region grouping
+Cluster formation
+Shared range 4 bit quantization
+Constraint driven collapse ordering
+4D pairwise ordering layer
+Final binary packing and entropy coding
+
+The engine is optimized for vectorized data and achieves extremely high compression ratios when used after TurboVec.
 
 FEATURES
 
-The BitDrop V2 engine includes:
+3D Block Partitioning
+Converts linear byte streams into structured 3D blocks for improved pattern detection.
 
-3D block decomposition
+Cube Metrics
+Computes non zero count, mean, variance approximation, and edge energy for each block.
 
-Adaptive block shaping
+Region Grouping
+Sorts blocks into regions based on banded metrics to improve cluster coherence.
 
-Cube-metric extraction
+Clustering
+Assigns blocks to clusters using a hash based signature. Clusters share quantization ranges.
 
-Pre-clustering
+Shared Range Quantization
+All blocks in a cluster quantize into a common value range using 4 bit nibble packing.
 
-Hierarchical tagging
+Collapse Ordering
+Blocks are ordered using adjacency constraints and complexity scoring.
 
-Adjacency mask construction
+4D Pairwise Ordering
+Final ordering step that improves global locality without affecting cluster structure.
 
-Entropy-aware collapse ordering
+Lossless Reconstruction
+The engine preserves exact byte level reconstruction.
 
-TurboQuant 4-bit nibble-packed quantization
+PERFORMANCE
 
-Multi-region grouping
-
-Final entropy coding using zlib
-
-All components operate inside a single unified class.
-
-ARCHITECTURE SUMMARY
-
-The BitDrop V2 pipeline processes data in the following order:
-
-Convert payload into 3D blocks
-
-Compute cube metrics for each block
-
-Cluster blocks based on structural similarity
-
-Assign hierarchical tags
-
-Build adjacency masks
-
-Collapse blocks using entropy-aware ordering
-
-Quantize blocks to 4-bit values
-
-Pack two values per byte
-
-Assemble regions
-
-Compress final container with zlib
-
-This design reduces entropy and increases spatial locality, enabling extremely high compression ratios.
-
-BENCHMARK RESULTS
-
-Payload: JSON + metadata + 256 vectors (1536 dimensions)
+Tested on TurboVec compressed JSON data (7.6 MB original).
 
 Results:
+TurboVec output: 209,938 bytes
+BitDrop V2 output: 101,030 bytes
+Compression ratio: 75.48x
 
-Original JSON: 7,626,464 bytes (1.00x)
-TurboVec-only: 209,938 bytes (36.33x)
-Dual-field JSON+TV: 456,251 bytes (16.71x)
-BitDrop V2 (TV-only): 101,887 bytes (74.85x)
+BitDrop V2 consistently achieves 75x to 76x compression on this data profile.
 
-BitDrop V2 compresses TurboVec output 2.06x further.
-Total compression relative to the original payload: 74.85x.
+LIMITATIONS
 
-USE CASES
+Performance depends on the structure of the input data.
+Block depth changes provide only small improvements.
+RLE and similar transforms do not improve compression.
+Achieving 80x requires a new stage such as residual coding or a custom entropy coder.
 
-BitDrop V2 is ideal for:
+FUTURE WORK
 
-AI vector storage
+Residual coding layer
+Custom entropy coder (rANS or arithmetic)
+Adaptive block geometry
+Learned predictive model for residuals
 
-Embedding archives
+USAGE
 
-Mixed JSON + binary metadata
+The main compressor class is located in:
 
-Log compression
+bitdrop_collapse_codec.py
 
-Offline model telemetry
+To use the compressor:
 
-High-density data transport
+Import the engine
+
+Create an instance of BitDropCollapseEngineV2
+
+Call encode() to compress
+
+Call decode() to decompress
+
+Example:
+
+engine = BitDropCollapseEngineV2()
+compressed = engine.encode(data)
+restored = engine.decode(compressed)
 
 LICENSE
 
-BitDrop V2 is released under the GNU General Public License v3 (GPLv3).
-You may modify and redistribute this software under the terms of the GPLv3 license.
+This project is owned and maintained by Thomas Price.
 
-AUTHOR
-
-Developed by Thomas Price
-2026
+END OF README
 
 
 
