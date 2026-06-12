@@ -1,102 +1,163 @@
-Project: 3D BitDrop Collapse Engine
+Project: BitDrop V2 + TurboVec Compression System
 Author: Thomas Price
-Year: 2026
+Date: June 2026
 
-DESCRIPTION
+OVERVIEW
 
-The 3D BitDrop Collapse Engine is a high density binary compression system designed to operate on structured byte streams such as TurboVec output. The engine uses 3D block geometry, metric driven clustering, shared range quantization, and deterministic collapse ordering to produce highly compressible binary layouts while remaining fully lossless.
+This repository contains the full implementation of a multi‑stage compression system designed for high‑dimensional AI vector data, mixed JSON payloads, logs, and metadata.
 
-This project contains the full implementation of BitDrop V2, including:
-3D block partitioning
-Cube metric analysis
-Region grouping
-Cluster formation
-Shared range 4 bit quantization
-Constraint driven collapse ordering
-4D pairwise ordering layer
-Final binary packing and entropy coding
+The system combines two major components:
 
-The engine is optimized for vectorized data and achieves extremely high compression ratios when used after TurboVec.
+TurboVec
+A vector‑aware quantization and delta‑encoding engine optimized for large embedding arrays.
+
+BitDrop V2
+A reversible 3D binary collapse engine that further compresses TurboVec output using block transforms, clustering, quantization, and structural ordering.
+
+Together, these components achieve extremely high compression ratios on AI workloads, often far beyond traditional compressors.
 
 FEATURES
 
-3D Block Partitioning
-Converts linear byte streams into structured 3D blocks for improved pattern detection.
+TurboVec:
 
-Cube Metrics
-Computes non zero count, mean, variance approximation, and edge energy for each block.
+4‑bit or 8‑bit quantization
 
-Region Grouping
-Sorts blocks into regions based on banded metrics to improve cluster coherence.
+Per‑vector delta encoding
 
-Clustering
-Assigns blocks to clusters using a hash based signature. Clusters share quantization ranges.
+SIMD‑friendly packing
 
-Shared Range Quantization
-All blocks in a cluster quantize into a common value range using 4 bit nibble packing.
+Deterministic output
 
-Collapse Ordering
-Blocks are ordered using adjacency constraints and complexity scoring.
+Suitable for embeddings from 512 to 4096 dimensions
 
-4D Pairwise Ordering
-Final ordering step that improves global locality without affecting cluster structure.
+BitDrop V2:
 
-Lossless Reconstruction
-The engine preserves exact byte level reconstruction.
+Global semantic transforms (auto‑selected)
 
-PERFORMANCE
+3D block partitioning
 
-Tested on TurboVec compressed JSON data (7.6 MB original).
+Pre‑clustering of blocks
 
-Results:
-TurboVec output: 209,938 bytes
-BitDrop V2 output: 101,030 bytes
-Compression ratio: 75.48x
+Adjacency masks for ordering
 
-BitDrop V2 consistently achieves 75x to 76x compression on this data profile.
+TurboQuant 4‑bit nibble packing
 
-LIMITATIONS
+4D pair metrics for final ordering
 
-Performance depends on the structure of the input data.
-Block depth changes provide only small improvements.
-RLE and similar transforms do not improve compression.
-Achieving 80x requires a new stage such as residual coding or a custom entropy coder.
+Fully reversible
 
-FUTURE WORK
+zlib final entropy coding
 
-Residual coding layer
-Custom entropy coder (rANS or arithmetic)
-Adaptive block geometry
-Learned predictive model for residuals
+Benchmark Suite:
 
-USAGE
+Unified benchmark for JSON, TurboVec, and BitDrop V2
 
-The main compressor class is located in:
+Deterministic vector generation
 
+Payload multiplier for pattern exposure
+
+Timing and SHA256 reporting
+
+DIRECTORY STRUCTURE
+
+bitdrop_core/
+ai/
+compression/
 bitdrop_collapse_codec.py
+(BitDrop V2 implementation)
 
-To use the compressor:
+python_wrapper/
+PyTurboVecEncoder
+(TurboVec Python interface)
 
-Import the engine
+benchmarks/
+unified_benchmark_v2_compression.py
+(Deterministic benchmark with payload multiplier)
 
-Create an instance of BitDropCollapseEngineV2
+docs/
+whitepaper.txt
+(Technical overview in plain text)
 
-Call encode() to compress
+HOW THE SYSTEM WORKS
 
-Call decode() to decompress
+Step 1: Input JSON is created containing text, metadata, and vector arrays.
 
-Example:
+Step 2: TurboVec encodes the vectors using quantization and delta transforms.
 
-engine = BitDropCollapseEngineV2()
-compressed = engine.encode(data)
-restored = engine.decode(compressed)
+Step 3: BitDrop V2 compresses the TurboVec output using:
+
+semantic transforms
+
+3D block grouping
+
+clustering
+
+quantization
+
+ordering
+
+zlib
+
+Step 4: The final compressed blob is produced.
+
+The system is fully reversible. BitDrop V2 decodes back to TurboVec output, and TurboVec reconstructs the original vectors.
+
+BENCHMARKING
+
+The benchmark script measures:
+
+TurboVec compression ratio
+
+Dual‑field JSON plus TurboVec
+
+BitDrop V2 compression ratio
+
+Timing for each stage
+
+SHA256 hashes for verification
+
+The PAYLOAD_MULTIPLIER setting allows testing larger synthetic datasets to expose long‑range redundancy.
+
+USE CASES
+
+Embedding storage for vector databases
+
+AI telemetry compression
+
+Log and metadata archival
+
+On‑device AI storage optimization
+
+Offline model distillation
+
+High‑volume inference pipelines
+
+REQUIREMENTS
+
+Python 3.10 or newer
+TurboVec Python wrapper
+Standard library only for BitDrop V2
+No external dependencies required
+
+RUNNING THE BENCHMARK
+
+Run the unified benchmark:
+
+python unified_benchmark_v2_compression.py
+
+Adjust PAYLOAD_MULTIPLIER to test larger datasets.
 
 LICENSE
 
-This project is owned and maintained by Thomas Price.
+This project is released under the MIT License unless otherwise specified.
+
+CONTACT
+
+Developer: Thomas Price
+Location: Crestwood, KY
+Purpose: High‑performance AI compression research
 
 END OF README
-
 
 
 

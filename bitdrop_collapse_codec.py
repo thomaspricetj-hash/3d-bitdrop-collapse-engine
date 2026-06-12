@@ -8,24 +8,23 @@ from typing import Any, Dict, List, Tuple, Optional
 
 class BitDropCollapseEngineV2:
     """
-    All-in-one 3D BitDrop engine with:
-      - Pre-clustering (3D-aware)
-      - 3D chunking
-      - Region grouping (cubic-metric sorted)
-      - Hierarchical tagging
-      - Rule-template generation
-      - Adjacency masks
-      - Rule pruning
-      - Constraint-driven collapse (entropy/complexity-aware)
-      - Stabilization
-      - TurboQuant-style 4-bit quantization (nibble-packed)
-      - Final binary container + entropy coding
+    3D BitDrop V2 – tuned for higher pattern exposure with low overhead
 
-    Extra structure:
-      - 3D stacked cube metrics in grouping
-      - Cluster-shared quantization ranges
-      - 4D stacked pair metrics used only for final ordering
-        (does not disturb 3D clustering/adjacency)
+      - Global semantic transforms (auto-selected mode):
+          * mode 0: none
+          * mode 1: vector-wise delta
+          * mode 2: dimension-variance permutation + vector-wise delta
+
+      - 3D chunking + region grouping
+      - Per-block adaptive transform modes:
+          * mode 0: raw
+          * mode 1: delta
+
+      - Pre-clustering + adjacency masks
+      - Constraint-driven collapse
+      - TurboQuant-style 4-bit quantization (cluster range)
+      - 4D pair metrics for final ordering
+      - zlib container
     """
 
     @dataclass
@@ -56,7 +55,7 @@ class BitDropCollapseEngineV2:
         allowed_delta: int
 
     MAGIC = b"BD3Q"
-    VERSION = 1
+    VERSION = 8  # semantic-mode auto + per-block delta
 
     def __init__(
         self,
@@ -66,6 +65,7 @@ class BitDropCollapseEngineV2:
         auto_tune_block_shape: bool = True,
         region_block_target: int = 2048,
         use_4d_pairs: bool = True,
+        vector_stride: Optional[int] = 128,  # TurboVec-style stride
     ):
         self.block_shape = block_shape
         self.level = level
@@ -73,7 +73,250 @@ class BitDropCollapseEngineV2:
         self.auto_tune_block_shape = auto_tune_block_shape
         self.region_block_target = region_block_target
         self.use_4d_pairs = use_4d_pairs
+        self.vector_stride = vector_stride
         self._tag_root = self.TagNode("ROOT", {})
+
+    # -----------------------------
+    # Semantic transforms (global, reversible)
+    # -----------------------------
+
+    def _build_dim_permutation(self, data: bytes) -> List[int]:
+        if not data or not self.vector_stride or self.vector_stride <= 0:
+            return []
+        stride = self.vector_stride
+        if len(data) < 2 * stride:
+            return list(range(stride))
+
+        counts = [0] * stride
+        sums = [0.0] * stride
+        sums_sq = [0.0] * stride
+
+        n = len(data)
+        for i in range(0, n - stride + 1, stride):
+            row = data[i:i + stride]
+            for j, v in enumerate(row):
+                counts[j] += 1
+                fv = float(v)
+                sums[j] += fv
+                sums_sq[j] += fv * fv
+
+        variances: List[Tuple[float, int]] = []
+        for j in range(stride):
+            c = counts[j]
+            if c <= 0:
+                variances.append((0.0, j))
+            else:
+                mean = sums[j] / c
+                var = (sums_sq[j] / c) - (mean * mean)
+                if var < 0.0:
+                    var = 0.0
+                variances.append((var, j))
+
+        variances.sort(key=lambda t: t[0])
+        perm = [idx for _, idx in variances]
+        return perm
+
+    def _apply_dim_permutation(self, data: bytes, perm: List[int]) -> bytes:
+        if not data or not perm or not self.vector_stride or self.vector_stride <= 0:
+            return data
+        stride = self.vector_stride
+        n = len(data)
+        out = bytearray(n)
+        plen = len(perm)
+        for base in range(0, n, stride):
+            end = min(base + stride, n)
+            if end - base < plen:
+                out[base:end] = data[base:end]
+                continue
+            for new_pos, old_pos in enumerate(perm):
+                out[base + new_pos] = data[base + old_pos]
+        return bytes(out)
+
+    def _apply_dim_inverse_permutation(self, data: bytes, perm: List[int]) -> bytes:
+        if not data or not perm or not self.vector_stride or self.vector_stride <= 0:
+            return data
+        stride = self.vector_stride
+        n = len(data)
+        out = bytearray(n)
+        plen = len(perm)
+        inv = [0] * plen
+        for new_pos, old_pos in enumerate(perm):
+            inv[old_pos] = new_pos
+        for base in range(0, n, stride):
+            end = min(base + stride, n)
+            if end - base < plen:
+                out[base:end] = data[base:end]
+                continue
+            for old_pos, new_pos in enumerate(inv):
+                out[base + old_pos] = data[base + new_pos]
+        return bytes(out)
+
+    def _forward_vector_delta(self, data: bytes) -> bytes:
+        if not data or not self.vector_stride or self.vector_stride <= 0:
+            return data
+        stride = self.vector_stride
+        n = len(data)
+        out = bytearray(n)
+        for base in range(0, n, stride):
+            end = min(base + stride, n)
+            prev = 0
+            for i in range(base, end):
+                v = data[i]
+                d = (v - prev) & 0xFF
+                out[i] = d
+                prev = v
+        return bytes(out)
+
+    def _inverse_vector_delta(self, data: bytes) -> bytes:
+        if not data or not self.vector_stride or self.vector_stride <= 0:
+            return data
+        stride = self.vector_stride
+        n = len(data)
+        out = bytearray(n)
+        for base in range(0, n, stride):
+            end = min(base + stride, n)
+            prev = 0
+            for i in range(base, end):
+                d = data[i]
+                v = (d + prev) & 0xFF
+                out[i] = v
+                prev = v
+        return bytes(out)
+
+    # -----------------------------
+    # Heuristic scoring (for zlib-friendliness)
+    # -----------------------------
+
+    def _score_bytes_for_zlib(self, data: bytes) -> int:
+        if not data:
+            return 0
+        transitions = 0
+        zeros = 0
+        prev = data[0]
+        if prev == 0:
+            zeros += 1
+        for v in data[1:]:
+            if v != prev:
+                transitions += 1
+            if v == 0:
+                zeros += 1
+            prev = v
+        return transitions - zeros  # lower is better
+
+    # -----------------------------
+    # Semantic mode auto-selection
+    # -----------------------------
+
+    def _semantic_forward_auto(self, data: bytes) -> Tuple[bytes, List[int], int]:
+        """
+        Returns (transformed_data, perm, semantic_mode)
+        semantic_mode:
+          0 = none
+          1 = vector-delta only
+          2 = dim-perm + vector-delta
+        """
+        if not data or not self.vector_stride or self.vector_stride <= 0:
+            return data, [], 0
+
+        # sample prefix for scoring
+        sample_len = min(len(data), 256 * (self.vector_stride or 1))
+        sample = data[:sample_len]
+
+        # mode 0: none
+        best_mode = 0
+        best_perm: List[int] = []
+        best_score = self._score_bytes_for_zlib(sample)
+
+        # mode 1: delta only
+        delta_sample = self._forward_vector_delta(sample)
+        score_delta = self._score_bytes_for_zlib(delta_sample)
+        if score_delta < best_score:
+            best_score = score_delta
+            best_mode = 1
+            best_perm = []
+
+        # mode 2: perm + delta
+        perm = self._build_dim_permutation(sample)
+        if perm:
+            perm_sample = self._apply_dim_permutation(sample, perm)
+            perm_delta_sample = self._forward_vector_delta(perm_sample)
+            score_perm_delta = self._score_bytes_for_zlib(perm_delta_sample)
+            if score_perm_delta < best_score:
+                best_score = score_perm_delta
+                best_mode = 2
+                best_perm = perm
+
+        # apply chosen mode to full data
+        if best_mode == 0:
+            return data, [], 0
+        elif best_mode == 1:
+            full = self._forward_vector_delta(data)
+            return full, [], 1
+        else:
+            # mode 2
+            if not best_perm:
+                best_perm = self._build_dim_permutation(data)
+            if best_perm:
+                data = self._apply_dim_permutation(data, best_perm)
+            full = self._forward_vector_delta(data)
+            return full, best_perm, 2
+
+    def _semantic_inverse_with_mode(self, data: bytes, perm: List[int], mode: int) -> bytes:
+        if not data:
+            return data
+        if mode == 0:
+            return data
+        if mode == 1:
+            return self._inverse_vector_delta(data)
+        if mode == 2:
+            data = self._inverse_vector_delta(data)
+            if perm:
+                data = self._apply_dim_inverse_permutation(data, perm)
+            return data
+        return data
+
+    # -----------------------------
+    # Per-block transform modes (raw / delta)
+    # -----------------------------
+
+    def _forward_delta(self, data: bytes) -> bytes:
+        if not data:
+            return data
+        out = bytearray(len(data))
+        prev = 0
+        for i, v in enumerate(data):
+            d = (v - prev) & 0xFF
+            out[i] = d
+            prev = v
+        return bytes(out)
+
+    def _inverse_delta(self, data: bytes) -> bytes:
+        if not data:
+            return data
+        out = bytearray(len(data))
+        prev = 0
+        for i, d in enumerate(data):
+            v = (d + prev) & 0xFF
+            out[i] = v
+            prev = v
+        return bytes(out)
+
+    def _choose_mode_for_block(self, data: bytes) -> int:
+        # try raw vs delta, pick better heuristic score
+        raw_score = self._score_bytes_for_zlib(data)
+        delta_data = self._forward_delta(data)
+        delta_score = self._score_bytes_for_zlib(delta_data)
+        return 1 if delta_score < raw_score else 0
+
+    def _apply_mode_forward(self, data: bytes, mode: int) -> bytes:
+        if mode == 1:
+            return self._forward_delta(data)
+        return data
+
+    def _apply_mode_inverse(self, data: bytes, mode: int) -> bytes:
+        if mode == 1:
+            return self._inverse_delta(data)
+        return data
 
     # -----------------------------
     # 3D Chunking + Grouping
@@ -116,13 +359,6 @@ class BitDropCollapseEngineV2:
         self,
         blocks: List["BitDropCollapseEngineV2.BinaryBlock3D"],
     ) -> List[List["BitDropCollapseEngineV2.BinaryBlock3D"]]:
-        """
-        Region grouping with cubic metrics:
-          - Compute cube metrics per block.
-          - Sort blocks by coarse bands of (mean, nz, var, edge).
-          - Then slice into regions of region_block_target blocks.
-        This keeps similar cubes near each other before clustering.
-        """
         if not blocks:
             return []
 
@@ -143,7 +379,11 @@ class BitDropCollapseEngineV2:
         n = len(sorted_blocks)
         step = max(1, self.region_block_target)
         for i in range(0, n, step):
-            regions.append(sorted_blocks[i:i + step])
+            region = sorted_blocks[i:i + step]
+            rid = len(regions)
+            for rb in region:
+                rb.tags["region_id"] = rid
+            regions.append(region)
         return regions
 
     # -----------------------------
@@ -154,11 +394,6 @@ class BitDropCollapseEngineV2:
         self,
         block: "BitDropCollapseEngineV2.BinaryBlock3D",
     ) -> Tuple[int, int, int, int]:
-        """
-        If block.data length matches the 3D shape, use full 3D edge walk.
-        If not (e.g., quantized/nibble-packed blocks), fall back to flat
-        metrics (nz, mean, var, edge=0) to avoid index errors.
-        """
         d0, d1, d2 = block.shape
         data = block.data
         if not data:
@@ -222,7 +457,7 @@ class BitDropCollapseEngineV2:
         return nz, mean, var_approx, edge_energy
 
     # -----------------------------
-    # 4D Pair Metrics (stacked cubes, for ordering only)
+    # 4D Pair Metrics (ordering only)
     # -----------------------------
 
     def _pair_metrics_map(
@@ -238,18 +473,30 @@ class BitDropCollapseEngineV2:
         for i in range(0, len(sorted_blocks), 2):
             b1 = sorted_blocks[i]
             nzA, meanA, varA, edgeA = self._cube_metrics(b1)
+            rA = b1.tags.get("region_id", 0)
+            cA = b1.tags.get("cluster_id", 0)
 
             if i + 1 < len(sorted_blocks):
                 b2 = sorted_blocks[i + 1]
                 nzB, meanB, varB, edgeB = self._cube_metrics(b2)
+                rB = b2.tags.get("region_id", 0)
+                cB = b2.tags.get("cluster_id", 0)
             else:
                 b2 = None
                 nzB, meanB, varB, edgeB = nzA, meanA, varA, edgeA
+                rB, cB = rA, cA
 
             nz_sum = nzA + nzB
             mean_avg = (meanA + meanB) // 2
             var_avg = (varA + varB) // 2
-            edge_avg = (edgeA + edgeB) // 2
+
+            layer_bonus = 0
+            if rA == rB:
+                layer_bonus += 1
+            if cA == cB:
+                layer_bonus += 2
+
+            edge_avg = ((edgeA + edgeB) // 2) ^ (layer_bonus << 4)
 
             nz_delta = abs(nzA - nzB)
             mean_delta = abs(meanA - meanB)
@@ -589,14 +836,21 @@ class BitDropCollapseEngineV2:
         blocks: List["BitDropCollapseEngineV2.BinaryBlock3D"],
         scales: List[float],
         zeros: List[float],
+        perm: List[int],
+        modes: List[int],
+        semantic_mode: int,
     ) -> bytes:
         if not blocks:
-            return (
+            header = (
                 self.MAGIC
                 + bytes([self.VERSION])
-                + struct.pack(">I", 0)
-                + struct.pack(">I", 0)
+                + bytes([semantic_mode & 0xFF])
+                + struct.pack(">I", 0)  # n_blocks
+                + struct.pack(">I", 0)  # block_size
+                + struct.pack(">H", 0)  # perm_len
+                + struct.pack(">I", 0)  # modes_len
             )
+            return header
 
         block_size = len(blocks[0].data)
         n_blocks = len(blocks)
@@ -604,8 +858,25 @@ class BitDropCollapseEngineV2:
         header = bytearray()
         header += self.MAGIC
         header += bytes([self.VERSION])
+        header += bytes([semantic_mode & 0xFF])
         header += struct.pack(">I", n_blocks)
         header += struct.pack(">I", block_size)
+
+        perm_bytes = b""
+        if perm:
+            plen = min(len(perm), 65535)
+            header += struct.pack(">H", plen)
+            perm_bytes = bytes(perm[:plen])
+        else:
+            header += struct.pack(">H", 0)
+
+        modes_bytes = b""
+        if modes:
+            mlen = len(modes)
+            header += struct.pack(">I", mlen)
+            modes_bytes = bytes(modes)
+        else:
+            header += struct.pack(">I", 0)
 
         meta = bytearray()
         for s, z in zip(scales, zeros):
@@ -616,7 +887,7 @@ class BitDropCollapseEngineV2:
         for b in blocks:
             body += b.data
 
-        return bytes(header) + bytes(meta) + bytes(body)
+        return bytes(header) + perm_bytes + modes_bytes + bytes(meta) + bytes(body)
 
     def _compress(self, container: bytes) -> bytes:
         return zlib.compress(container, level=self.level)
@@ -627,7 +898,7 @@ class BitDropCollapseEngineV2:
     def _unpack_blocks(
         self,
         container: bytes,
-    ) -> Tuple[List["BitDropCollapseEngineV2.BinaryBlock3D"], List[float], List[float]]:
+    ) -> Tuple[List["BitDropCollapseEngineV2.BinaryBlock3D"], List[float], List[float], List[int], List[int], int]:
         off = 0
         magic = container[off:off + 4]
         off += 4
@@ -637,10 +908,28 @@ class BitDropCollapseEngineV2:
         off += 1
         if ver != self.VERSION:
             raise ValueError("Bad version")
+        semantic_mode = container[off]
+        off += 1
         n_blocks = struct.unpack(">I", container[off:off + 4])[0]
         off += 4
         block_size = struct.unpack(">I", container[off:off + 4])[0]
         off += 4
+        perm_len = struct.unpack(">H", container[off:off + 2])[0]
+        off += 2
+
+        perm: List[int] = []
+        if perm_len > 0:
+            perm_bytes = container[off:off + perm_len]
+            off += perm_len
+            perm = [int(b) for b in perm_bytes]
+
+        modes_len = struct.unpack(">I", container[off:off + 4])[0]
+        off += 4
+        modes: List[int] = []
+        if modes_len > 0:
+            modes_bytes = container[off:off + modes_len]
+            off += modes_len
+            modes = [int(b) for b in modes_bytes]
 
         scales: List[float] = []
         zeros: List[float] = []
@@ -665,13 +954,14 @@ class BitDropCollapseEngineV2:
                 )
             )
 
-        return blocks, scales, zeros
+        return blocks, scales, zeros, perm, modes, semantic_mode
 
     # -----------------------------
     # Public API
     # -----------------------------
 
     def encode(self, payload_bytes: bytes) -> bytes:
+        payload_bytes, perm, semantic_mode = self._semantic_forward_auto(payload_bytes)
         self._auto_tune_shape(len(payload_bytes))
 
         blocks = self._to_blocks(payload_bytes)
@@ -680,6 +970,7 @@ class BitDropCollapseEngineV2:
         collapsed_all: List[BitDropCollapseEngineV2.BinaryBlock3D] = []
         scales_all: List[float] = []
         zeros_all: List[float] = []
+        modes_all: List[int] = []
 
         for region in regions:
             clusters = self._cluster_blocks(region)
@@ -697,7 +988,15 @@ class BitDropCollapseEngineV2:
                 vmin, vmax = self._cluster_value_range(stabilized)
 
                 for b in stabilized:
-                    qdata, scale, zero = self._quantize_block_with_range(b, vmin, vmax)
+                    mode = self._choose_mode_for_block(b.data)
+                    tdata = self._apply_mode_forward(b.data, mode)
+                    qb = self.BinaryBlock3D(
+                        data=tdata,
+                        shape=b.shape,
+                        tags=b.tags,
+                        index=b.index,
+                    )
+                    qdata, scale, zero = self._quantize_block_with_range(qb, vmin, vmax)
                     collapsed_all.append(
                         self.BinaryBlock3D(
                             data=qdata,
@@ -708,35 +1007,59 @@ class BitDropCollapseEngineV2:
                     )
                     scales_all.append(scale)
                     zeros_all.append(zero)
+                    modes_all.append(mode)
 
         if self.use_4d_pairs and collapsed_all:
             pair_map = self._pair_metrics_map(collapsed_all)
             if pair_map:
                 keyed = []
-                for b, s, z in zip(collapsed_all, scales_all, zeros_all):
+                for b, s, z, m in zip(collapsed_all, scales_all, zeros_all, modes_all):
                     k = self._pair_signature_for_block(b, pair_map)
-                    keyed.append((k, b, s, z))
+                    keyed.append((k, b, s, z, m))
                 keyed.sort(key=lambda t: (t[0], t[1].index))
                 collapsed_all = [t[1] for t in keyed]
                 scales_all = [t[2] for t in keyed]
                 zeros_all = [t[3] for t in keyed]
+                modes_all = [t[4] for t in keyed]
 
-        container = self._pack_blocks(collapsed_all, scales_all, zeros_all)
+        container = self._pack_blocks(
+            collapsed_all,
+            scales_all,
+            zeros_all,
+            perm,
+            modes_all,
+            semantic_mode,
+        )
         blob = self._compress(container)
         return blob
 
     def decode(self, blob: bytes) -> bytes:
         container = self._decompress(blob)
-        qblocks, scales, zeros = self._unpack_blocks(container)
+        qblocks, scales, zeros, perm, modes, semantic_mode = self._unpack_blocks(container)
 
         d0, d1, d2 = self.block_shape
         n_elems = d0 * d1 * d2
 
         out = bytearray()
-        for b, s, z in zip(qblocks, scales, zeros):
+        for idx, (b, s, z) in enumerate(zip(qblocks, scales, zeros)):
             data = self._dequantize_block(b.data, s, z, n_elems)
+            mode = modes[idx] if idx < len(modes) else 0
+            data = self._apply_mode_inverse(data, mode)
             out += data
-        return bytes(out)
+
+        out_bytes = bytes(out)
+        out_bytes = self._semantic_inverse_with_mode(out_bytes, perm, semantic_mode)
+        return out_bytes
+
+
+
+
+
+
+
+
+
+
 
 
 

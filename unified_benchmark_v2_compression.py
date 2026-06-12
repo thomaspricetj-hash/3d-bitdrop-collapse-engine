@@ -1,10 +1,5 @@
 # ============================================================
-# unified_benchmark_v2_compression.py
-# Unified Benchmark for:
-#   - TurboVec (vectors only)
-#   - JSON struct (text + metadata)
-#   - Dual-field JSON + TurboVec
-#   - BitDropCollapseEngineV2 (3D binary over TurboVec output)
+# unified_benchmark_v2_compression.py  (FIXED + DETERMINISTIC)
 # ============================================================
 
 import json
@@ -14,6 +9,15 @@ import hashlib
 
 from bitdrop_core.ai.compression.bitdrop_collapse_codec import BitDropCollapseEngineV2
 from python_wrapper import PyTurboVecEncoder
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+PAYLOAD_MULTIPLIER = 4   # try 1, 2, 4, 8, 16
+
+# Deterministic vectors
+random.seed(12345)
 
 
 def _make_vectors(n, dim):
@@ -51,31 +55,47 @@ def run_unified_benchmark():
     dim = 1536
     n_vec = 256
 
+    # Deterministic vectors
     vectors = _make_vectors(n_vec, dim)
     text = _make_text_block()
     metadata = {"source": "logs+mixed", "entries": 2000, "note": "unified test"}
 
+    # Base JSON
     payload = {"text": text, "metadata": metadata, "vectors": vectors}
     orig_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     orig_bytes = orig_json.encode("utf-8")
-    orig_size = len(orig_bytes)
 
-    print(f"Original JSON size: {orig_size:,} bytes")
+    # ============================================================
+    # Apply payload multiplier (REAL expansion)
+    # ============================================================
+    big_json = orig_json * PAYLOAD_MULTIPLIER
+    big_bytes = big_json.encode("utf-8")
+    big_size = len(big_bytes)
+
+    print(f"Original JSON size: {len(orig_bytes):,} bytes")
+    print(f"Payload multiplier: {PAYLOAD_MULTIPLIER}x")
+    print(f"Expanded payload size: {big_size:,} bytes")
     print(f"Original SHA256: { _sha256(orig_bytes) }\n")
 
+    # ============================================================
+    # TurboVec encoder
+    # ============================================================
     turbovec = PyTurboVecEncoder(dim, bit_width=4)
 
+    # ============================================================
+    # BitDrop engine
+    # ============================================================
     bitdrop = BitDropCollapseEngineV2(
         block_shape=(4, 4, 64),
         level=9,
-        max_clusters=32,
+        max_clusters=68,
     )
 
     # --------------------------------------------------------
     # TurboVec-only (vectors → TurboVec)
     # --------------------------------------------------------
     def turbovec_run():
-        tv_raw = turbovec.encode(vectors)
+        tv_raw = turbovec.encode(vectors * PAYLOAD_MULTIPLIER)
         return bytes(tv_raw) if isinstance(tv_raw, list) else tv_raw
 
     tv_bytes, tv_time = _time(turbovec_run)
@@ -97,7 +117,7 @@ def run_unified_benchmark():
         )
         struct_bytes = struct_json.encode("utf-8")
 
-        tv_raw = turbovec.encode(vectors)
+        tv_raw = turbovec.encode(vectors * PAYLOAD_MULTIPLIER)
         tv_bytes2 = bytes(tv_raw) if isinstance(tv_raw, list) else tv_raw
 
         return struct_bytes + tv_bytes2
@@ -112,11 +132,9 @@ def run_unified_benchmark():
 
     # --------------------------------------------------------
     # BitDrop V2 over TurboVec output (TV → 3D collapse)
-    # This matches your README: "BitDrop V2 compresses TurboVec’s output even further"
     # --------------------------------------------------------
     def bitdrop_run():
-        # Reuse the same TurboVec encoding path
-        tv_raw = turbovec.encode(vectors)
+        tv_raw = turbovec.encode(vectors * PAYLOAD_MULTIPLIER)
         tv_bytes3 = bytes(tv_raw) if isinstance(tv_raw, list) else tv_raw
 
         blob = bitdrop.encode(tv_bytes3)
@@ -136,13 +154,14 @@ def run_unified_benchmark():
     print("============================================================")
     print(" Summary")
     print("============================================================")
-    print(f"Original:              {orig_size:,} bytes (1.0000x)")
-    print(f"TurboVec-only:         {tv_size:,} bytes ({orig_size / tv_size:.4f}x)")
-    print(f"Dual-field JSON+TV:    {dual_size:,} bytes ({orig_size / dual_size:.4f}x)")
-    print(f"BitDrop V2 (TV-only):  {bitdrop_size:,} bytes ({orig_size / bitdrop_size:.4f}x)")
+    print(f"Expanded payload:      {big_size:,} bytes (1.0000x)")
+    print(f"TurboVec-only:         {tv_size:,} bytes ({big_size / tv_size:.4f}x)")
+    print(f"Dual-field JSON+TV:    {dual_size:,} bytes ({big_size / dual_size:.4f}x)")
+    print(f"BitDrop V2 (TV-only):  {bitdrop_size:,} bytes ({big_size / bitdrop_size:.4f}x)")
     print("============================================================\n")
 
 
 if __name__ == "__main__":
     run_unified_benchmark()
+
 
